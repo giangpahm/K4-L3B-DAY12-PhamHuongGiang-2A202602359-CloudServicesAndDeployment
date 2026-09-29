@@ -55,11 +55,13 @@ class AskResponse(BaseModel):
     tokens: int
 
 
+from fastapi.responses import JSONResponse
+
 @app.get("/health")
-def health(response: Response):
+def health():
+    """Liveness probe: không phụ thuộc dependency, báo 503 khi đang tắt."""
     if lifecycle.shutting_down:
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "shutting_down"}
+        return JSONResponse(status_code=503, content={"status": "shutting_down"})
     log_event("health_check_called", level="info")
     return {"status": "ok"}
 
