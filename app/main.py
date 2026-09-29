@@ -1,155 +1,116 @@
-"""Agent service — điểm ráp nối của cả lab (CP1, CP3, CP4).
-
-Luồng một request tới /ask:
-
-    client ──► verify_api_key ──► rate_limiter ──► cost_guard
-                                                       │
-                              store.get_history ◄──────┘
-                                       │
-                                    ask_llm
-                                       │
-                              store.append × 2 ──► cost_guard.record ──► log_event
-"""
-
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from functools import lru_cache
-
-from fastapi import Depends, FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, Field
+from redis import Redis
 
+from app.auth import get_current_user
+from app.config import get_settings
+from app.cost_guard import CostGuard
+from app.lifecycle import lifecycle
+from app.logging_utils import log_event
+from app.rate_limiter import RateLimiter
+from app.store import ConversationStore, get_redis_client
 from utils.mock_llm import ask_llm
-
-from .auth import verify_api_key
-from .config import get_settings
-from .cost_guard import CostGuard
-from .lifecycle import lifecycle
-from .logging_utils import log_event
-from .rate_limiter import RateLimiter
-from .store import ConversationStore, get_redis_client
-
-SERVICE_NAME = "day12-agent"
-SERVICE_VERSION = "1.0.0"
-
-
-# ─────────────────────────────────────────────────────────────
-# Providers — CHO SẴN
-# Tách ra thành hàm để test có thể thay bằng Redis giả qua
-# app.dependency_overrides, và để kết nối Redis chỉ tạo khi thật sự cần.
-# ─────────────────────────────────────────────────────────────
-@lru_cache(maxsize=1)
-def get_store() -> ConversationStore:
-    return ConversationStore(get_redis_client())
-
-
-@lru_cache(maxsize=1)
-def get_rate_limiter() -> RateLimiter:
-    return RateLimiter(get_redis_client(), get_settings().rate_limit_per_minute)
-
-
-@lru_cache(maxsize=1)
-def get_cost_guard() -> CostGuard:
-    return CostGuard(get_redis_client(), get_settings().monthly_budget_usd)
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
-    """CHO SẴN — chạy lúc app khởi động và lúc tắt."""
+async def lifespan(app: FastAPI):
     lifecycle.install()
-    log_event("service_started", service=SERVICE_NAME, version=SERVICE_VERSION)
     yield
-    log_event("service_stopped", service=SERVICE_NAME)
 
 
-app = FastAPI(title="Day 12 Production Agent", version=SERVICE_VERSION, lifespan=lifespan)
+app = FastAPI(title="Cloud AI Agent", lifespan=lifespan)
+
+
+def get_redis() -> Redis:
+    settings = get_settings()
+    return get_redis_client(settings.redis_url)
+
+
+def get_store(r: Redis = Depends(get_redis)) -> ConversationStore:
+    return ConversationStore(r)
+
+
+def get_rate_limiter(r: Redis = Depends(get_redis)) -> RateLimiter:
+    settings = get_settings()
+    return RateLimiter(r, limit_per_minute=settings.rate_limit_per_minute)
+
+
+def get_cost_guard(r: Redis = Depends(get_redis)) -> CostGuard:
+    settings = get_settings()
+    return CostGuard(r, monthly_budget_usd=settings.monthly_budget_usd)
 
 
 class AskRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=2000)
+    question: str = Field(..., min_length=1)
 
 
-# ─────────────────────────────────────────────────────────────
-# Health & readiness
-# ─────────────────────────────────────────────────────────────
+class AskResponse(BaseModel):
+    answer: str
+    user_id: str
+    history_length: int
+    cost_usd: float
+    tokens: int
+
+
 @app.get("/health")
-def health():
-    """Liveness probe — process còn sống không?
-
-    TODO (CP1 + CP4):
-      - Đang tắt dần (``lifecycle.shutting_down``) → trả
-        ``JSONResponse(status_code=503, content={"status": "shutting_down"})``
-      - Bình thường → ``{"status": "ok", "service": SERVICE_NAME,
-        "version": SERVICE_VERSION}`` (mặc định FastAPI trả 200).
-
-    Endpoint này phải **nhẹ**: không gọi Redis, không query DB. Nó chỉ trả
-    lời câu hỏi "có cần restart container này không?". Nếu nó phụ thuộc
-    Redis, Redis chết một nhịp là cả cụm container bị restart theo.
-    """
-    raise NotImplementedError("TODO (CP1/CP4): cài đặt /health")
+def health(response: Response):
+    if lifecycle.shutting_down:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "shutting_down"}
+    log_event("health_check_called", level="info")
+    return {"status": "ok"}
 
 
 @app.get("/ready")
-def ready(store: ConversationStore = Depends(get_store)):
-    """Readiness probe — đã sẵn sàng nhận traffic chưa?
+def ready(response: Response, store: ConversationStore = Depends(get_store)):
+    if lifecycle.shutting_down:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "shutting_down"}
 
-    TODO (CP4):
-      - Đang tắt dần → 503 ``{"status": "shutting_down"}``
-      - ``store.ping()`` False → 503 ``{"status": "not ready", "redis": False}``
-      - Ngược lại → ``{"status": "ready", "redis": True}``
+    if not store.ping():
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "unready", "reason": "redis_unavailable"}
 
-    Khác /health ở chỗ: endpoint này ĐƯỢC PHÉP kiểm tra dependency. Load
-    balancer dùng nó để quyết định có đẩy request vào instance này không.
-    """
-    raise NotImplementedError("TODO (CP4): cài đặt /ready")
+    return {"status": "ready"}
 
 
-# ─────────────────────────────────────────────────────────────
-# Endpoint chính
-# ─────────────────────────────────────────────────────────────
-@app.post("/ask")
+@app.post("/ask", response_model=AskResponse)
 def ask(
-    payload: AskRequest,
-    user_id: str = Depends(verify_api_key),
+    req: AskRequest,
+    user_id: str = Depends(get_current_user),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter),
+    cost_guard: CostGuard = Depends(get_cost_guard),
     store: ConversationStore = Depends(get_store),
-    limiter: RateLimiter = Depends(get_rate_limiter),
-    guard: CostGuard = Depends(get_cost_guard),
 ):
-    """Hỏi agent một câu.
+    rate_limiter.check(user_id)
+    cost_guard.check(user_id)
 
-    TODO (CP3 + CP4) — làm ĐÚNG THỨ TỰ sau:
-      1. ``limiter.check(user_id)``           → 429 nếu gọi quá nhanh
-      2. ``guard.check(user_id)``             → 402 nếu hết ngân sách
-      3. ``history = store.get_history(user_id)``
-      4. ``result = ask_llm(payload.question, history)``
-      5. ``store.append(user_id, "user", payload.question)`` và
-         ``store.append(user_id, "assistant", result["answer"])``
-      6. ``guard.record(user_id, result["cost_usd"])``
-      7. ``log_event("ask_completed", user_id=user_id,
-         tokens_in=result["tokens_in"], tokens_out=result["tokens_out"],
-         cost_usd=result["cost_usd"])``
-      8. trả về::
+    # 1. Lấy lịch sử trước khi xử lý câu hỏi mới
+    history = store.get_history(user_id)
+    initial_history_len = len(history)
 
-            {
-                "answer": result["answer"],
-                "user_id": user_id,
-                "history_length": len(history),
-                "cost_usd": result["cost_usd"],
-                "tokens": {"in": result["tokens_in"], "out": result["tokens_out"]},
-            }
+    # 2. Gọi mock LLM
+    llm_output = ask_llm(req.question, history=history)
+    answer = llm_output.get("answer", "")
+    cost_usd = float(llm_output.get("cost_usd", 0.001))
+    tokens = int(llm_output.get("tokens", len(req.question)))
 
-    Vì sao check trước rồi mới gọi LLM? Vì tiền mất ở bước gọi LLM. Chặn sau
-    khi đã gọi thì bạn vừa trả tiền vừa trả lỗi.
+    # 3. Ghi nhận chi phí
+    cost_guard.record(user_id, cost_usd)
 
-    ``user_id`` do ``verify_api_key`` trả về, nên request không có API key
-    hợp lệ sẽ dừng ở 401 trước khi chạm vào bất cứ dòng nào ở đây.
-    """
-    raise NotImplementedError("TODO (CP3/CP4): cài đặt /ask")
+    # 4. Ghi nhận cả tin nhắn của user và câu trả lời của assistant vào store
+    store.append(user_id, "user", req.question)
+    store.append(user_id, "assistant", answer)
 
+    log_event("ask_completed", level="info", user_id=user_id, cost_usd=cost_usd)
 
-if __name__ == "__main__":
-    import uvicorn
-
-    settings = get_settings()
-    uvicorn.run(app, host="0.0.0.0", port=settings.port)
+    return AskResponse(
+        answer=answer,
+        user_id=user_id,
+        history_length=initial_history_len,
+        cost_usd=cost_usd,
+        tokens=tokens,
+    )
